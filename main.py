@@ -8,6 +8,14 @@ from transformers import AutoImageProcessor, AutoModel
 from skimage.transform import resize
 from skimage.color import rgb2hsv
 
+# Optional filters/morphology for better separation/refinement
+try:
+    from skimage.filters import sobel
+    from skimage.morphology import remove_small_objects, binary_opening, binary_closing, disk
+    HAVE_MORPH = True
+except Exception:
+    HAVE_MORPH = False
+
 # --- 1. Load Model and Processor ---
 processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitl16-pretrain-sat493m")
 model = AutoModel.from_pretrained("facebook/dinov3-vitl16-pretrain-sat493m")
@@ -107,60 +115,122 @@ except Exception:
     PCA = None
     KMeans = None
 
-if PCA is not None and KMeans is not None:
-    # Reduce to 50D for speed without losing too much structure
-    pca = PCA(n_components=min(50, patch_tokens.shape[1]))
-    feats = pca.fit_transform(patch_tokens)
-    # KMeans clustering into K segments
-    K = 3  # you can tweak K
-    kmeans = KMeans(n_clusters=K, n_init=10, random_state=42)
-    labels = kmeans.fit_predict(feats)  # (H*W,)
+# Compute per-patch color/texture/saliency features aligned to (h, w)
+img_np = np.array(image).astype(np.float32) / 255.0
+img_small = resize(img_np, (h, w, 3), preserve_range=True, anti_aliasing=True)
+img_hsv = rgb2hsv(img_small)
+R, G, B = img_small[..., 0], img_small[..., 1], img_small[..., 2]
+S = img_hsv[..., 1]
+V = img_hsv[..., 2]
+blue_ratio = B / (R + G + B + 1e-6)
 
-if labels is None:
-    # Fallback: simple 2-means via numpy (very basic). Not as good as sklearn.
-    K = 2
-    # init centroids randomly
+# Texture via Sobel on grayscale
+gray_small = 0.299 * R + 0.587 * G + 0.114 * B
+if HAVE_MORPH:
+    tex = sobel(gray_small)
+else:
+    # Simple gradient approximation if sobel unavailable
+    gy = np.zeros_like(gray_small)
+    gx = np.zeros_like(gray_small)
+    gy[1:, :] = np.abs(gray_small[1:, :] - gray_small[:-1, :])
+    gx[:, 1:] = np.abs(gray_small[:, 1:] - gray_small[:, :-1])
+    tex = (gx + gy) * 0.5
+
+# Patch-level saliency (normalize fmap_2d to [0,1])
+sal_patch = fmap_2d.detach().cpu().numpy()
+sal_patch = (sal_patch - sal_patch.min())
+if sal_patch.max() > 1e-6:
+    sal_patch = sal_patch / sal_patch.max()
+
+# Normalize auxiliary features to [0,1] for balanced clustering/scoring
+feature_list = []
+for comp in [R, G, B, S, V, blue_ratio, tex, sal_patch]:
+    comp_n = comp - comp.min()
+    maxv = comp_n.max()
+    if maxv > 1e-6:
+        comp_n = comp_n / maxv
+    feature_list.append(comp_n)
+
+aux_feats = np.stack(feature_list, axis=-1).reshape(-1, len(feature_list))  # (H*W, F)
+
+# Build clustering features: DINO features (optionally PCA) + auxiliary features
+if PCA is not None:
+    pca = PCA(n_components=min(50, patch_tokens.shape[1]))
+    dino_feats = pca.fit_transform(patch_tokens)
+else:
+    dino_feats = patch_tokens
+
+feats = np.concatenate([dino_feats, aux_feats], axis=1)
+
+if KMeans is not None:
+    K = 5
+    kmeans = KMeans(n_clusters=K, n_init=10, random_state=42)
+    labels = kmeans.fit_predict(feats)
+else:
+    # Fallback: simple numpy KMeans-like (K=4)
+    K = 4
     rng = np.random.default_rng(42)
-    centroids = patch_tokens[rng.choice(patch_tokens.shape[0], size=K, replace=False)]
-    for _ in range(10):
-        dists = ((patch_tokens[:, None, :] - centroids[None, :, :]) ** 2).sum(axis=2)
+    centroids = feats[rng.choice(feats.shape[0], size=K, replace=False)]
+    for _ in range(15):
+        dists = ((feats[:, None, :] - centroids[None, :, :]) ** 2).sum(axis=2)
         labels = dists.argmin(axis=1)
         for k in range(K):
             if np.any(labels == k):
-                centroids[k] = patch_tokens[labels == k].mean(axis=0)
+                centroids[k] = feats[labels == k].mean(axis=0)
 
 # Reshape labels to (h, w)
 labels_2d = labels.reshape(h, w)
 
-# --- 7. Heuristic to select "glacier-like" cluster ---
-# Glacier/ice tends to be bright (high V) and low saturation (low S) in RGB.
-
-# Downsample original image to patch grid to align per-patch stats
-img_np = np.array(image).astype(np.float32) / 255.0
-# skimage.resize expects (rows, cols, channels) -> (H, W, C)
-img_small = resize(img_np, (h, w, 3), preserve_range=True, anti_aliasing=True)
-img_hsv = rgb2hsv(img_small)
-S = img_hsv[..., 1]
-V = img_hsv[..., 2]
-
+# --- 7. Score clusters to select glacier ---
+# Use normalized V (bright), low S, higher blue_ratio, moderate-to-low texture, and higher saliency
 cluster_scores = []
+cluster_debug = []
 for k in range(labels_2d.max() + 1):
-    mask_k = (labels_2d == k)
-    if mask_k.sum() == 0:
+    m = (labels_2d == k)
+    if m.sum() == 0:
         cluster_scores.append(-np.inf)
+        cluster_debug.append((k, 0, 0, 0, 0, 0))
         continue
-    # score: bright but low saturation
-    score = (V[mask_k].mean() - 0.6 * S[mask_k].mean())
+    V_k = V[m].mean()
+    S_k = S[m].mean()
+    Bk = blue_ratio[m].mean()
+    T_k = tex[m].mean()
+    Sal_k = sal_patch[m].mean()
+    # Water penalty: very dark patches are unlikely to be glacier
+    water_pen = max(0.0, 0.45 - V_k)
+    # Score weights (tunable)
+    score = 1.2 * V_k - 0.8 * S_k + 0.5 * Bk + 0.3 * Sal_k - 0.6 * T_k - 0.8 * water_pen
     cluster_scores.append(score)
+    cluster_debug.append((k, V_k, S_k, Bk, T_k, Sal_k))
 
 glacier_k = int(np.argmax(cluster_scores))
-print(f"Selected cluster {glacier_k} as glacier-like (scores={cluster_scores}).")
+print("Cluster scoring (k, V, S, blue_ratio, texture, sal):")
+for k, V_k, S_k, Bk, T_k, Sal_k in cluster_debug:
+    print(f"  {k}: V={V_k:.3f}, S={S_k:.3f}, B={Bk:.3f}, T={T_k:.3f}, Sal={Sal_k:.3f}, score={cluster_scores[k]:.3f}")
+print(f"Selected cluster {glacier_k} as glacier-like.")
 
-# Binary mask at patch resolution
-glacier_mask_patch = (labels_2d == glacier_k).astype(np.float32)
+# Binary mask at patch resolution (and refine)
+mask_patch = (labels_2d == glacier_k)
 
-# Upsample glacier mask to image resolution (nearest neighbor)
-mask_up = resize(glacier_mask_patch, (image.height, image.width), order=0, preserve_range=True, anti_aliasing=False).astype(np.float32)
+# Simple morphological refinement at patch scale (optional)
+if HAVE_MORPH:
+    mask_patch_ref = binary_opening(mask_patch, footprint=disk(1))
+    mask_patch_ref = binary_closing(mask_patch_ref, footprint=disk(1))
+else:
+    mask_patch_ref = mask_patch
+
+# Upsample refined mask to image resolution (nearest neighbor)
+mask_up = resize(mask_patch_ref.astype(np.float32), (image.height, image.width), order=0, preserve_range=True, anti_aliasing=False)
+
+# Image-level morphological cleanup: remove tiny regions, smooth edges
+if HAVE_MORPH:
+    # Remove very small objects: <0.2% of image area
+    area_thresh = int(0.002 * mask_up.size)
+    mask_bool = mask_up > 0.5
+    mask_bool = remove_small_objects(mask_bool, min_size=area_thresh)
+    mask_bool = binary_opening(mask_bool, footprint=disk(2))
+    mask_bool = binary_closing(mask_bool, footprint=disk(2))
+    mask_up = mask_bool.astype(np.float32)
 
 # Normalize saliency for visualization
 sal = saliency_map_resized
@@ -187,10 +257,10 @@ axes[1, 0].imshow(labels_2d, cmap='tab20')
 axes[1, 0].set_title(f"Patch Clusters (K={labels_2d.max()+1})")
 axes[1, 0].axis('off')
 
-# Glacier mask overlay
+# Glacier mask overlay (refined)
 axes[1, 1].imshow(image)
 axes[1, 1].imshow(mask_up, cmap='Blues', alpha=0.45)
-axes[1, 1].set_title("Glacier-like Region (heuristic)")
+axes[1, 1].set_title("Glacier-like Region (refined)")
 axes[1, 1].axis('off')
 
 plt.tight_layout()
@@ -200,7 +270,7 @@ plt.savefig('dinov3_glacier_demo.png', dpi=200)
 
 # Save raw mask for downstream use
 mask_uint8 = (mask_up * 255).astype(np.uint8)
-Image.fromarray(mask_uint8).save('glacier_mask.png')
+Image.fromarray(mask_uint8).save('glacier_mask_refined.png')
 
 # Also save saliency (attention/similarity) map for convenience
 sal_uint8 = (sal * 255).astype(np.uint8)
