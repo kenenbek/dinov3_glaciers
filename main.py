@@ -12,12 +12,25 @@ from skimage.color import rgb2hsv
 processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitl16-pretrain-sat493m")
 model = AutoModel.from_pretrained("facebook/dinov3-vitl16-pretrain-sat493m")
 
-# --- 2. Force the Model Configuration to Output Attentions ---
-#
-# THIS IS THE NEW, CRITICAL FIX.
+# Try to switch attention implementation to 'eager' so we can request attentions
+try:
+    if hasattr(model, "set_attn_implementation"):
+        model.set_attn_implementation("eager")
+    elif hasattr(model.config, "attn_implementation"):
+        model.config.attn_implementation = "eager"
+    elif hasattr(model.config, "_attn_implementation"):
+        model.config._attn_implementation = "eager"
+except Exception as _e:
+    print(f"Warning: Could not set attn_implementation to 'eager': {_e}")
+
+# --- 2. Request attentions if supported ---
 # We manually set the configuration to ensure attention weights are returned.
-#
-model.config.output_attentions = True
+try:
+    model.config.output_attentions = True
+    want_attentions = True
+except Exception as _e:
+    print(f"Warning: Could not enable output_attentions on config: {_e}")
+    want_attentions = False
 
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,21 +52,37 @@ inputs = {k: v.to(device) for k, v in inputs.items()}
 
 
 # --- 4. Model Inference ---
-# We will still pass the flag here for good measure.
+# Prefer attentions if possible; if it errors, fall back gracefully
 with torch.no_grad():
-    outputs = model(**inputs, output_attentions=True)
+    try:
+        outputs = model(**inputs, output_attentions=want_attentions)
+        attentions_available = want_attentions and getattr(outputs, 'attentions', None) is not None
+    except ValueError as e:
+        print(f"Model forward with attentions failed, retrying without attentions: {e}")
+        outputs = model(**inputs, output_attentions=False)
+        attentions_available = False
 
 
-# --- 5. Process Attention Maps ---
-# Now, outputs.attentions should contain the attention data.
-attentions = outputs.attentions[-1]  # Shape: (batch_size, num_heads, seq_length, seq_length)
-
-# Average the attention weights across all heads for the [CLS] token.
-num_heads = attentions.shape[1]
-cls_attention = attentions[0, :, 0, 1:].mean(dim=0)
+# --- 5. Attention or CLS-sim Heatmap ---
+if attentions_available:
+    # outputs.attentions: tuple of tensors; use last layer
+    attentions = outputs.attentions[-1]  # (batch, heads, seq, seq)
+    # Average across heads for [CLS] -> patch attention
+    cls_attention = attentions[0, :, 0, 1:].mean(dim=0)  # (H*W,)
+    fmap_1d = cls_attention
+    map_name = "CLS Attention"
+else:
+    # Fallback: use cosine similarity between CLS token and patch tokens as a saliency map
+    last_hidden = outputs.last_hidden_state  # (1, N+1, D)
+    cls = last_hidden[0, 0, :]
+    patches = last_hidden[0, 1:, :]
+    cls_n = cls / (cls.norm(p=2) + 1e-6)
+    patches_n = patches / (patches.norm(p=2, dim=1, keepdim=True) + 1e-6)
+    fmap_1d = (patches_n @ cls_n)  # (H*W,)
+    map_name = "CLS–Patch Cosine Similarity"
 
 # Determine patch grid size (h, w)
-num_patches = cls_attention.numel()
+num_patches = fmap_1d.numel()
 side = int(np.sqrt(num_patches))
 if side * side == num_patches:
     h = w = side
@@ -65,10 +94,10 @@ else:
     w = img_width_processed // patch_size
     h = img_height_processed // patch_size
 
-attention_map = cls_attention.reshape(h, w)
+fmap_2d = fmap_1d.reshape(h, w)
 
-# Resize the attention map to the original image size for overlay
-attention_map_resized = resize(attention_map.detach().cpu().numpy(), (image.height, image.width), preserve_range=True)
+# Resize the map to the original image size for overlay
+saliency_map_resized = resize(fmap_2d.detach().cpu().numpy(), (image.height, image.width), preserve_range=True)
 
 # --- 6. Extract Patch Features and Cluster (Self-supervised segmentation) ---
 # tokens: (1, 1 + H*W, D) for ViT-like models. Exclude CLS (index 0)
@@ -139,6 +168,12 @@ glacier_mask_patch = (labels_2d == glacier_k).astype(np.float32)
 # Upsample glacier mask to image resolution (nearest neighbor)
 mask_up = resize(glacier_mask_patch, (image.height, image.width), order=0, preserve_range=True, anti_aliasing=False).astype(np.float32)
 
+# Normalize saliency for visualization
+sal = saliency_map_resized
+sal = (sal - sal.min())
+if sal.max() > 0:
+    sal = sal / sal.max()
+
 # --- 8. Visualize and Save Results ---
 fig, axes = plt.subplots(2, 2, figsize=(14, 12))
 
@@ -147,13 +182,13 @@ axes[0, 0].imshow(image)
 axes[0, 0].set_title("Original Image")
 axes[0, 0].axis('off')
 
-# Attention overlay
+# Saliency overlay (attention or similarity)
 axes[0, 1].imshow(image)
-axes[0, 1].imshow(attention_map_resized, cmap='jet', alpha=0.45)
-axes[0, 1].set_title("DINOv3 CLS-attention Overlay")
+axes[0, 1].imshow(sal, cmap='jet', alpha=0.45)
+axes[0, 1].set_title(f"DINOv3 {map_name} Overlay")
 axes[0, 1].axis('off')
 
-# KMeans segmentation (all clusters)
+# Patch clustering (all clusters)
 axes[1, 0].imshow(labels_2d, cmap='tab20')
 axes[1, 0].set_title(f"Patch Clusters (K={labels_2d.max()+1})")
 axes[1, 0].axis('off')
@@ -173,9 +208,6 @@ plt.savefig('dinov3_glacier_demo.png', dpi=200)
 mask_uint8 = (mask_up * 255).astype(np.uint8)
 Image.fromarray(mask_uint8).save('glacier_mask.png')
 
-# Also save attention overlay for convenience
-attn_vis = (attention_map_resized - np.min(attention_map_resized))
-if attn_vis.max() > 0:
-    attn_vis = attn_vis / attn_vis.max()
-attn_vis_uint8 = (attn_vis * 255).astype(np.uint8)
-Image.fromarray(attn_vis_uint8).save('attention_map.png')
+# Also save saliency (attention/similarity) map for convenience
+sal_uint8 = (sal * 255).astype(np.uint8)
+Image.fromarray(sal_uint8).save('saliency_map.png')
