@@ -50,6 +50,13 @@ except FileNotFoundError:
 inputs = processor(images=image, return_tensors="pt")
 inputs = {k: v.to(device) for k, v in inputs.items()}
 
+# Derive patch grid from preprocessed tensor and model patch size
+patch_size = getattr(getattr(model.config, 'vision_config', model.config), 'patch_size', 16)
+H_proc = int(inputs['pixel_values'].shape[2])
+W_proc = int(inputs['pixel_values'].shape[3])
+h = H_proc // patch_size
+w = W_proc // patch_size
+num_patch_tokens = h * w
 
 # --- 4. Model Inference ---
 # Prefer attentions if possible; if it errors, fall back gracefully
@@ -67,32 +74,19 @@ with torch.no_grad():
 if attentions_available:
     # outputs.attentions: tuple of tensors; use last layer
     attentions = outputs.attentions[-1]  # (batch, heads, seq, seq)
-    # Average across heads for [CLS] -> patch attention
-    cls_attention = attentions[0, :, 0, 1:].mean(dim=0)  # (H*W,)
+    # Average across heads for [CLS] -> patch attention, take only H*W patch tokens
+    cls_attention = attentions[0, :, 0, 1:1+num_patch_tokens].mean(dim=0)  # (H*W,)
     fmap_1d = cls_attention
     map_name = "CLS Attention"
 else:
     # Fallback: use cosine similarity between CLS token and patch tokens as a saliency map
-    last_hidden = outputs.last_hidden_state  # (1, N+1, D)
+    last_hidden = outputs.last_hidden_state  # (1, N+1+reg, D)
     cls = last_hidden[0, 0, :]
-    patches = last_hidden[0, 1:, :]
+    patches = last_hidden[0, 1:1+num_patch_tokens, :]  # take first H*W as spatial tokens
     cls_n = cls / (cls.norm(p=2) + 1e-6)
     patches_n = patches / (patches.norm(p=2, dim=1, keepdim=True) + 1e-6)
     fmap_1d = (patches_n @ cls_n)  # (H*W,)
     map_name = "CLS–Patch Cosine Similarity"
-
-# Determine patch grid size (h, w)
-num_patches = fmap_1d.numel()
-side = int(np.sqrt(num_patches))
-if side * side == num_patches:
-    h = w = side
-else:
-    # Fallback to using patch size if available
-    patch_size = getattr(getattr(model.config, 'vision_config', model.config), 'patch_size', 16)
-    img_height_processed = inputs['pixel_values'].shape[2]
-    img_width_processed = inputs['pixel_values'].shape[3]
-    w = img_width_processed // patch_size
-    h = img_height_processed // patch_size
 
 fmap_2d = fmap_1d.reshape(h, w)
 
@@ -100,9 +94,9 @@ fmap_2d = fmap_1d.reshape(h, w)
 saliency_map_resized = resize(fmap_2d.detach().cpu().numpy(), (image.height, image.width), preserve_range=True)
 
 # --- 6. Extract Patch Features and Cluster (Self-supervised segmentation) ---
-# tokens: (1, 1 + H*W, D) for ViT-like models. Exclude CLS (index 0)
-last_hidden = outputs.last_hidden_state  # (B, N+1, D)
-patch_tokens = last_hidden[0, 1:, :].detach().cpu().numpy()  # (H*W, D)
+# tokens: (1, 1 + H*W, D) for ViT-like models. Exclude CLS (index 0) and any register tokens after H*W
+last_hidden = outputs.last_hidden_state  # (B, N+1+reg, D)
+patch_tokens = last_hidden[0, 1:1+num_patch_tokens, :].detach().cpu().numpy()  # (H*W, D)
 
 labels = None
 # Optional: PCA to compact features for faster clustering
