@@ -12,13 +12,10 @@ from skimage.transform import resize
 from skimage.color import rgb2hsv
 from skimage.filters import sobel, threshold_otsu
 from skimage.morphology import remove_small_objects, binary_opening, binary_closing, disk
-from skimage.segmentation import slic, find_boundaries
+from skimage.segmentation import slic, find_boundaries, random_walker
 
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
-
-import pydensecrf.densecrf as dcrf
-from pydensecrf.utils import unary_from_softmax
 
 # Reproducibility
 np.random.seed(42)
@@ -127,7 +124,7 @@ probs_patch = clf.predict_proba(feats)[:, 1]  # glacier probability
 
 probs_2d = probs_patch.reshape(h, w)
 
-# --- 8. Upscale and refine with superpixels and CRF ---
+# --- 8. Upscale and refine with superpixels + Random Walker ---
 prob_img = resize(probs_2d, (H_img, W_img), order=1, preserve_range=True, anti_aliasing=True)
 prob_img = np.clip(prob_img, 0.0, 1.0).astype(np.float32)
 
@@ -141,18 +138,12 @@ for seg_id in np.unique(segments):
     prob_sp[mask_sp] = mean_p
 prob_img = prob_sp
 
-# Dense CRF refinement
-num_classes = 2
-d = dcrf.DenseCRF2D(W_img, H_img, num_classes)
-# Unary expects shape (num_classes, H*W)
-unary = unary_from_softmax(np.vstack([1 - prob_img.reshape(-1), prob_img.reshape(-1)])).astype(np.float32)
-d.setUnaryEnergy(unary)
-# Pairwise Gaussian and bilateral
-img_uint8 = (img_np * 255).astype(np.uint8)
-d.addPairwiseGaussian(sxy=3, compat=3)
-d.addPairwiseBilateral(sxy=50, srgb=13, rgbim=img_uint8, compat=5)
-Q = d.inference(5)
-prob_img = np.array(Q[1]).reshape(H_img, W_img).astype(np.float32)
+# Random Walker refinement guided by the RGB image and seeds from prob_img
+labels_seed = np.full((H_img, W_img), -1, dtype=np.int32)
+labels_seed[prob_img > 0.8] = 1
+labels_seed[prob_img < 0.2] = 0
+probs_rw = random_walker(img_np, labels_seed, beta=120, mode='cg_mg', tol=1e-3, return_full_prob=True)
+prob_img = probs_rw[1].astype(np.float32)
 
 # --- 9. Morphological cleanup and border extraction ---
 th = threshold_otsu(prob_img)
@@ -195,7 +186,7 @@ axes[1, 0].axis('off')
 
 # Refined probability
 axes[1, 1].imshow(prob_img, cmap='viridis', vmin=0, vmax=1)
-axes[1, 1].set_title("Refined Probability (SLIC + CRF)")
+axes[1, 1].set_title("Refined Probability (SLIC + RandomWalker)")
 axes[1, 1].axis('off')
 
 # Final mask + borders
