@@ -57,8 +57,8 @@ def segment_glacier(patch_features, original_shape, n_clusters=3):
     Segment the image into regions (glacier, rock, snow, etc.)
     using K-means clustering on DINOv3 features
     """
-    # Remove batch dimension and CLS token
-    features = patch_features[0, 1:, :].cpu().numpy()  # Skip CLS token
+    # Remove batch dimension and CLS token, convert BFloat16 to float32 for numpy compatibility
+    features = patch_features[0, 1:, :].float().cpu().numpy()  # Skip CLS token
 
     # Perform clustering
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
