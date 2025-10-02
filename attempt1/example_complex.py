@@ -52,7 +52,7 @@ def extract_features_with_dinov3(image, patch_size=16):
     return patch_features, inputs.pixel_values.shape
 
 
-def segment_glacier(patch_features, original_shape, n_clusters=3):
+def segment_glacier(patch_features, input_shape, n_clusters=3):
     """
     Segment the image into regions (glacier, rock, snow, etc.)
     using K-means clustering on DINOv3 features
@@ -64,10 +64,38 @@ def segment_glacier(patch_features, original_shape, n_clusters=3):
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     labels = kmeans.fit_predict(features)
 
-    # Reshape labels to 2D grid (image patches)
-    # Calculate patch grid dimensions
-    num_patches = int(np.sqrt(len(labels)))
-    labels_2d = labels.reshape(num_patches, num_patches)
+    # Calculate actual patch grid dimensions from input
+    # DINOv3 uses 16x16 patches by default
+    patch_size = 16
+    batch_size, channels, height, width = input_shape
+
+    # Calculate number of patches in each dimension
+    num_patches_h = height // patch_size
+    num_patches_w = width // patch_size
+
+    print(f"Features shape: {features.shape}, Labels shape: {labels.shape}")
+    print(f"Expected grid: {num_patches_h}x{num_patches_w} = {num_patches_h * num_patches_w}")
+
+    # Verify we have the right number of patches
+    expected_patches = num_patches_h * num_patches_w
+    if len(labels) != expected_patches:
+        print(f"Warning: Expected {expected_patches} patches but got {len(labels)}")
+        # Fallback: try to make it as square as possible
+        num_patches = int(np.sqrt(len(labels)))
+        if num_patches * num_patches != len(labels):
+            # If not perfect square, pad or truncate
+            closest_square = num_patches * num_patches
+            if len(labels) > closest_square:
+                labels = labels[:closest_square]
+            else:
+                # Pad with the most common label
+                most_common_label = np.bincount(labels).argmax()
+                padding = np.full(closest_square - len(labels), most_common_label)
+                labels = np.concatenate([labels, padding])
+        labels_2d = labels.reshape(num_patches, num_patches)
+    else:
+        # Reshape using actual dimensions
+        labels_2d = labels.reshape(num_patches_h, num_patches_w)
 
     return labels_2d, kmeans
 
