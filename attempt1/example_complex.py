@@ -40,7 +40,7 @@ def extract_features_with_dinov3(image, patch_size=16):
         "facebook/dinov3-vit7b16-pretrain-lvd1689m",
         dtype=torch.bfloat16,
         device_map="auto",
-        quantization_config=quantization_config
+        # quantization_config=quantization_config
     )
 
     # Process image
