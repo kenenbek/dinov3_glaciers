@@ -15,6 +15,8 @@ from skimage import measure, morphology
 import cv2
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from skimage.filters import threshold_otsu
+from sklearn.metrics import silhouette_score
 
 
 def load_and_preprocess_image(image_path):
@@ -36,7 +38,7 @@ def extract_features_with_dinov3(image, patch_size=16):
 
     model = AutoModel.from_pretrained(
         "facebook/dinov3-vit7b16-pretrain-lvd1689m",
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="auto",
         quantization_config=quantization_config
     )
@@ -58,6 +60,7 @@ def segment_glacier(patch_features, input_shape, n_clusters=3):
     """
     Segment the image into regions (glacier, rock, snow, etc.)
     using K-means clustering on DINOv3 features
+    Returns labels grid, fitted kmeans, per-cluster soft probabilities at patch grid, and chosen_k.
     """
     # Calculate actual patch grid dimensions from input (ViT patch size = 16)
     patch_size = 16
@@ -68,11 +71,15 @@ def segment_glacier(patch_features, input_shape, n_clusters=3):
 
     # Extract only spatial patch tokens (exclude special tokens like CLS/register)
     tokens = patch_features[0]  # [num_tokens, hidden_dim]
-    if tokens.shape[0] >= expected_patches:
-        spatial_tokens = tokens[-expected_patches:]
-    else:
-        # Fallback if model returned fewer tokens than expected
-        spatial_tokens = tokens[1:]  # best-effort skip CLS
+    spatial_tokens = tokens[-expected_patches:]
+    n_tokens = spatial_tokens.shape[0]
+    if n_tokens != expected_patches:
+        if n_tokens > expected_patches:
+            spatial_tokens = spatial_tokens[:expected_patches]
+        else:
+            pad_count = expected_patches - n_tokens
+            pad = spatial_tokens[-1:].repeat(pad_count, 1)
+            spatial_tokens = torch.cat([spatial_tokens, pad], dim=0)
 
     # Convert to float32 numpy
     features = spatial_tokens.float().cpu().numpy()
@@ -86,17 +93,47 @@ def segment_glacier(patch_features, input_shape, n_clusters=3):
     pca = PCA(n_components=n_components, random_state=42)
     features_pca = pca.fit_transform(features_std)
 
-    # Perform clustering on PCA-reduced features
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(features_pca)
+    # Determine K
+    if isinstance(n_clusters, str) and n_clusters.lower() == 'auto':
+        best_k = None
+        best_score = -1
+        best_kmeans = None
+        for k in range(3, 7):
+            km = KMeans(n_clusters=k, random_state=42, n_init=10)
+            lbl = km.fit_predict(features_pca)
+            if len(np.unique(lbl)) < 2:
+                continue
+            try:
+                score = silhouette_score(features_pca, lbl)
+            except Exception:
+                score = -1
+            if score > best_score:
+                best_score = score
+                best_k = k
+                best_kmeans = km
+        chosen_k = best_k if best_k is not None else 4
+        kmeans = best_kmeans if best_kmeans is not None else KMeans(n_clusters=chosen_k, random_state=42, n_init=10).fit(features_pca)
+        labels = kmeans.labels_
+    else:
+        chosen_k = int(n_clusters)
+        kmeans = KMeans(n_clusters=chosen_k, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(features_pca)
 
-    print(f"Features (tokens): {tokens.shape[0]}, spatial: {features.shape}, PCA: {features_pca.shape}")
-    print(f"Patch grid: {num_patches_h} x {num_patches_w} = {expected_patches}, labels: {labels.shape}")
+    # Soft probabilities from distances to cluster centers
+    distances = kmeans.transform(features_pca)  # [N, K]
+    logits = -distances
+    logits = logits - logits.max(axis=1, keepdims=True)  # numerical stability
+    exp_logits = np.exp(logits)
+    probs = exp_logits / (exp_logits.sum(axis=1, keepdims=True) + 1e-12)
+
+    print(f"Features (tokens): {tokens.shape[0]}, spatial used: {features.shape}, PCA: {features_pca.shape}")
+    print(f"Patch grid: {num_patches_h} x {num_patches_w} = {expected_patches}, labels: {labels.shape}, K={chosen_k}")
 
     # Reshape using actual dimensions
     labels_2d = labels.reshape(num_patches_h, num_patches_w)
+    probs_3d = probs.reshape(num_patches_h, num_patches_w, chosen_k)
 
-    return labels_2d, kmeans
+    return labels_2d, kmeans, probs_3d, chosen_k
 
 
 def upscale_segmentation(labels_2d, target_size):
@@ -107,6 +144,25 @@ def upscale_segmentation(labels_2d, target_size):
         interpolation=cv2.INTER_NEAREST
     )
     return labels_upscaled.astype(np.int32)
+
+
+def upscale_probabilities(prob_grid, target_size):
+    """
+    Upscale per-cluster probability grid [H_p, W_p, K] to image size [H, W, K] smoothly.
+    """
+    H, W = target_size
+    K = prob_grid.shape[2]
+    up = []
+    for k in range(K):
+        ch = prob_grid[:, :, k].astype(np.float32)
+        ch_up = cv2.resize(ch, (W, H), interpolation=cv2.INTER_LINEAR)
+        # Light smoothing to reduce block artifacts while preserving edges
+        ch_up = cv2.GaussianBlur(ch_up, (0, 0), sigmaX=0.8, sigmaY=0.8)
+        up.append(ch_up)
+    up = np.stack(up, axis=-1)
+    # Re-normalize to sum to 1 across clusters
+    denom = up.sum(axis=-1, keepdims=True) + 1e-12
+    return up / denom
 
 
 def identify_glacier_cluster(segmentation_map, image_rgb):
@@ -312,21 +368,33 @@ def detect_glacier_borders(image_path, n_clusters=3, visualize=True, refine_meth
     patch_features, input_shape = extract_features_with_dinov3(image)
 
     print("Segmenting image...")
-    labels_2d, kmeans = segment_glacier(patch_features, input_shape, n_clusters=n_clusters)
+    labels_2d, kmeans, probs_3d, chosen_k = segment_glacier(patch_features, input_shape, n_clusters=n_clusters)
 
-    print("Upscaling segmentation...")
-    segmentation_map = upscale_segmentation(labels_2d, image_array.shape[:2])
+    print("Upscaling segmentation probabilities...")
+    probs_up = upscale_probabilities(probs_3d, image_array.shape[:2])  # [H, W, K]
 
-    print("Identifying glacier cluster...")
+    # Derive hard labels for visualization/cluster selection
+    segmentation_map = np.argmax(probs_up, axis=-1).astype(np.int32)
+
+    print(f"Identifying glacier cluster (K={chosen_k})...")
     glacier_label = identify_glacier_cluster(segmentation_map, image_array)
 
-    initial_mask = (segmentation_map == glacier_label)
+    # Build initial mask from glacier probability with automatic thresholding
+    print("Building initial mask from glacier probability map...")
+    glacier_prob = probs_up[:, :, glacier_label]
+    # Save probability map for debugging
+    cv2.imwrite('glacier_probability.png', (np.clip(glacier_prob, 0, 1) * 255).astype(np.uint8))
+    # Otsu threshold on normalized 0..1 map
+    thr = threshold_otsu(glacier_prob)
+    initial_mask = (glacier_prob >= thr)
 
     print("Refining glacier mask...")
     refined_mask = refine_glacier_mask(image_array, initial_mask, method=refine_method)
 
     print("Extracting glacier borders...")
     glacier_mask_clean, contours, edges = extract_glacier_borders(refined_mask)
+    # Save edges for debugging
+    cv2.imwrite('glacier_edges.png', edges)
 
     print("Saving results...")
     area_pixels = save_glacier_data(glacier_mask_clean, contours)
@@ -334,6 +402,8 @@ def detect_glacier_borders(image_path, n_clusters=3, visualize=True, refine_meth
     if visualize:
         print("Visualizing results...")
         visualize_results(image, segmentation_map, glacier_mask_clean, contours, edges)
+        # Save a quick composite too
+        cv2.imwrite('glacier_segment.png', (segmentation_map.astype(np.float32) / max(1, chosen_k - 1) * 255).astype(np.uint8))
 
     return glacier_mask_clean, contours, area_pixels
 
@@ -345,9 +415,9 @@ if __name__ == "__main__":
     # Detect glacier borders
     glacier_mask, contours, area = detect_glacier_borders(
         IMAGE_PATH,
-        n_clusters=5,  # Slightly more clusters helps separate ice/snow/rock/shadow
+        n_clusters='auto',  # auto-select clusters for better separation
         visualize=True,
-        refine_method='morph'  # try 'grabcut' for sharper edges if OpenCV is available
+        refine_method='morph'
     )
 
     print(f"\nDetection complete!")
