@@ -202,10 +202,11 @@ def identify_glacier_cluster(segmentation_map, image_rgb):
     saturation_vals = np.array([c['saturation'] for c in cluster_stats])
     area_vals = np.array([c['area'] for c in cluster_stats], dtype=float)
 
-    # Min-max normalize
-    b_norm = (brightness_vals - brightness_vals.min()) / (brightness_vals.ptp() + 1e-6)
-    s_norm = (saturation_vals - saturation_vals.min()) / (saturation_vals.ptp() + 1e-6)
-    a_norm = (np.log1p(area_vals) - np.log1p(area_vals).min()) / (np.log1p(area_vals).ptp() + 1e-6)
+    # Min-max normalize using NumPy 2.0-compatible np.ptp
+    b_norm = (brightness_vals - brightness_vals.min()) / (np.ptp(brightness_vals) + 1e-6)
+    s_norm = (saturation_vals - saturation_vals.min()) / (np.ptp(saturation_vals) + 1e-6)
+    log_area = np.log1p(area_vals)
+    a_norm = (log_area - log_area.min()) / (np.ptp(log_area) + 1e-6)
 
     # Higher brightness, lower saturation, larger area
     score = 0.6 * b_norm + 0.3 * (1 - s_norm) + 0.1 * a_norm
