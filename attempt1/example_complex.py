@@ -26,14 +26,14 @@ def extract_features_with_dinov3(image, patch_size=16):
     Extract dense features from DINOv3 model
     Returns features for each patch of the image
     """
-    processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+    processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vits16plus-pretrain-lvd1689m")
 
     # Use smaller model for faster processing, or use the larger one you specified
     quant_type = Int4WeightOnlyConfig(group_size=128)
     quantization_config = TorchAoConfig(quant_type=quant_type)
 
     model = AutoModel.from_pretrained(
-        "facebook/dinov2-base",  # Or use "facebook/dinov2-large" for better quality
+        "facebook/dinov3-vit7b16-pretrain-lvd1689m",
         torch_dtype=torch.bfloat16,
         device_map="auto",
         quantization_config=quantization_config
