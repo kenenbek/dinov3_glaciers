@@ -4,6 +4,8 @@ from netrc import netrc, NetrcParseError
 from tqdm import tqdm
 import requests
 from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
 
 ### USER SETTINGS ###
 
@@ -13,13 +15,12 @@ from pathlib import Path
 wkt_aoi = 'POLYGON ((74.487648 42.479187, 74.473057 42.475769, 74.474258 42.463613, 74.487648 42.436127, 74.510994 42.433846, 74.523869 42.448035, 74.503269 42.467032, 74.487648 42.479187))'
 
 # 2. Define the start and end dates for your entire time series.
-start_date = '2017-01-01'
-end_date = '2020-12-31'
+start_date = '2014-01-01'
+end_date = '2025-12-31'
 
-# 3. Define the months you are interested in (e.g., end of melt season).
-#    This will find images only from August and September for every year.
-start_month = 8
-end_month = 9
+# 3. Define the month you are interested in (e.g., end of melt season).
+#    This will find images only from August for every year.
+target_month = 8  # August
 
 # 4. Choose the satellite pass direction (stick to one!).
 #    Note: Constants live under FLIGHT_DIRECTION
@@ -29,6 +30,39 @@ pass_direction = asf.FLIGHT_DIRECTION.ASCENDING  # or asf.FLIGHT_DIRECTION.DESCE
 download_folder = 'kyrgyzstan_glacier_data'
 
 ### END OF USER SETTINGS ###
+
+
+def filter_august_one_per_year(results, target_month=8):
+    """
+    Filter results to only include images from the target month (August by default),
+    selecting one image per year (preferring mid-month dates).
+    """
+    # Group results by year
+    by_year = defaultdict(list)
+
+    for r in results:
+        try:
+            # Get the start time from the result
+            start_time = r.properties.get('startTime')
+            if start_time:
+                # Parse the datetime
+                dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+
+                # Only include images from the target month
+                if dt.month == target_month:
+                    by_year[dt.year].append((dt, r))
+        except Exception as e:
+            continue
+
+    # Select one image per year (closest to the 15th of the month)
+    filtered_results = []
+    for year, year_results in sorted(by_year.items()):
+        # Sort by how close to the 15th of the month
+        year_results.sort(key=lambda x: abs(x[0].day - 15))
+        filtered_results.append(year_results[0][1])
+        print(f"  Year {year}: {year_results[0][0].strftime('%Y-%m-%d')}")
+
+    return filtered_results
 
 
 def build_session_from_netrc():
@@ -137,7 +171,7 @@ def main():
 
     print("Searching for Sentinel-1 data...")
 
-    # Base search kwargs
+    # Base search kwargs (removed season parameter as it doesn't work properly)
     base_kwargs = dict(
         platform=asf.PLATFORM.SENTINEL1,
         processingLevel=[asf.PRODUCT_TYPE.GRD_HD, asf.PRODUCT_TYPE.GRD_MS],  # Exclude OPERA products
@@ -146,7 +180,6 @@ def main():
         intersectsWith=wkt_aoi,
         start=start_date,
         end=end_date,
-        season=(start_month, end_month),  # Seasonal filter (Aug–Sep)
     )
 
     # Perform the search using your criteria
@@ -164,64 +197,28 @@ def main():
     except Exception as e:
         print(f"An unexpected error occurred during search: {e}")
 
-    print(f"Found {len(results)} images matching your criteria.")
+    print(f"Found {len(results)} images total.")
 
-    # Fallback 1: remove season filter if no results
-    if len(results) == 0:
-        print("No results with seasonal filter. Retrying without season...")
-        try:
-            kwargs2 = base_kwargs.copy()
-            kwargs2.pop('season', None)
-            search_results = asf.search(**kwargs2)
-            results = []
-            for r in search_results:
-                try:
-                    results.append(r)
-                except Exception:
-                    continue
-            print(f"Found {len(results)} images after removing season filter.")
-        except asf.ASFSearchError as e:
-            print(f"Retry without season failed with ASFSearchError: {e}")
-            results = []
-        except Exception as e:
-            print(f"An unexpected error occurred during retry without season: {e}")
-            results = []
-
-    # Fallback 2: also remove flightDirection if still no results
-    if len(results) == 0:
-        print("Still no results. Retrying without flight direction constraint...")
-        try:
-            kwargs3 = base_kwargs.copy()
-            kwargs3.pop('season', None)
-            kwargs3.pop('flightDirection', None)
-            search_results = asf.search(**kwargs3)
-            results = []
-            for r in search_results:
-                try:
-                    results.append(r)
-                except Exception:
-                    continue
-            print(f"Found {len(results)} images after removing season and flight direction.")
-        except asf.ASFSearchError as e:
-            print(f"Retry without flight direction failed with ASFSearchError: {e}")
-        except Exception as e:
-            print(f"An unexpected error occurred during retry without flight direction: {e}")
-
-    # Preview first few scene IDs for feedback
-    if not results:
-        print("No results found after all attempts.")
+    # Filter to only August images, one per year
+    if len(results) > 0:
+        print(f"\nFiltering for August images (one per year):")
+        results = filter_august_one_per_year(results, target_month)
+        print(f"\nFiltered to {len(results)} images (one per year in August).")
+    else:
+        print("No results found. Try adjusting your AOI, date range, or filters.")
         return
 
-    # Try to preview scene names with better error handling
-    print("\nSample results:")
-    for i, r in enumerate(results[:5]):
-        try:
-            scene_name = r.properties.get('sceneName', 'Unknown')
-            print(f" - {scene_name}")
-        except Exception as e:
-            print(f" - Result {i+1} (unable to get scene name)")
+    # Preview scene IDs
+    if results:
+        print("\nSelected images:")
+        for i, r in enumerate(results):
+            try:
+                scene_name = r.properties.get('sceneName', 'Unknown')
+                start_time = r.properties.get('startTime', 'Unknown')
+                print(f" - {scene_name} ({start_time})")
+            except Exception as e:
+                print(f" - Result {i+1} (unable to get scene info)")
 
-    if len(results) > 0:
         # Authenticate with Earthdata using ~/.netrc if available
         session = build_session_from_netrc()
         if session is None:
@@ -230,8 +227,6 @@ def main():
         else:
             # Download all the found images with progress bars
             download_results_with_progress(results, download_folder, session)
-    else:
-        print("\nNo results found. Try adjusting your AOI, date range, or filters.")
 
 
 if __name__ == '__main__':

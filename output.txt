@@ -1,0 +1,21 @@
+/home/kenenbek/anaconda3/envs/glaciers/lib/python3.12/site-packages/skimage/segmentation/random_walker_segmentation.py:566: UserWarning: "cg_mg" not available, it requires pyamg to be installed. The "cg_j" mode will be used instead.
+  X = _solve_linear_system(lap_sparse, B, tol, mode)
+/home/kenenbek/anaconda3/envs/glaciers/lib/python3.12/site-packages/skimage/_shared/utils.py:456: UserWarning: The probability range is outside [0, 1] given the tolerance `prob_tol`. Consider decreasing `beta` and/or decreasing `tol`.
+  return func(*args, **kwargs)
+Script starting...
+[1/9] Loading DINOv3 model and processor...
+    Using device: cpu
+[2/9] Loading image: /home/kenenbek/PycharmProjects/dinov3_glaciers/img.png
+    Image size: 1529x795
+[3/9] Running DINOv3 forward pass...
+[4/9] Patch grid: 14x14 (patch_size=16)
+[5/9] Building features (PCA on DINO + color/texture/saliency)...
+    Feature matrix: (196, 72)
+[6/9] Fitting GaussianMixture (2 components) and mapping snow cluster...
+    Snow component index: 0
+[7/9] Refining with SLIC superpixels and Random Walker...
+Traceback (most recent call last):
+  File "/home/kenenbek/PycharmProjects/dinov3_glaciers/main.py", line 149, in <module>
+    prob_img = probs_rw[1].astype(np.float32)
+               ~~~~~~~~^^^
+IndexError: index 1 is out of bounds for axis 0 with size 1
